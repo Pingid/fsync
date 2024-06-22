@@ -71,24 +71,29 @@ impl Syncronize {
 
         // Read all source files and create the destination folder structure
         let sync_clone = sync.clone();
-        let src_files = jwalk::WalkDir::new(&sync_clone.src)
+        let src_files = jwalk::WalkDirGeneric::<((), ())>::new(&sync_clone.src)
             .skip_hidden(sync_clone.skip_hidden)
             .parallelism(jwalk::Parallelism::RayonExistingPool {
                 pool: thread_pool.clone(),
                 busy_timeout: None,
             })
-            .process_read_dir(move |depth, path, _, c| {
+            .process_read_dir(move |depth, path, state, c| {
                 if depth.is_none() {
                     return;
                 }
                 sync_clone.sync_dir(&path, c);
             });
 
-        // Collect source files
+        // Write symlinks
         src_files
             .into_iter()
             .map(|x| match x {
-                Ok(_) => Ok(()),
+                Ok(x) => {
+                    if x.path_is_symlink() {
+                        return sync.sync_symlink(&x.path());
+                    }
+                    Ok(())
+                }
                 Err(e) => Err(anyhow::Error::msg(e.to_string())),
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -115,7 +120,8 @@ impl Syncronize {
         // Syncronize files
         for entry in children {
             if let Ok(entry) = entry {
-                if entry.path().is_file() {
+                let pth = entry.path();
+                if pth.is_file() && !pth.is_symlink() {
                     match self.sync_file(&entry.path()) {
                         Ok(_) => {}
                         Err(e) => {
@@ -142,16 +148,8 @@ impl Syncronize {
             return Ok(());
         }
 
-        // Write symlink
-        if meta.is_symlink() {
-            let link_path = std::fs::read_link(&src)?;
-            if exists {
-                std::fs::remove_file(&dest)?;
-            }
-            self.symlink(&link_path, &dest)?;
-        } else {
-            self.copy_file(&meta, &src, &dest)?;
-        }
+        // Copy file data
+        self.copy_file(&meta, &src, &dest)?;
 
         self.progress.add_copied(1);
         self.progress.add_bytes_copied(meta.len() as usize);
@@ -165,6 +163,27 @@ impl Syncronize {
         let atime = meta.accessed()?;
         filetime::set_file_times(&dest, atime.into(), mtime.into())?;
 
+        Ok(())
+    }
+
+    fn sync_symlink(&self, src: &Path) -> anyhow::Result<()> {
+        let dest: PathBuf = self.get_destination_path(&src);
+        let link_path = std::fs::read_link(&src)?;
+        if dest.exists() {
+            let meta = src.symlink_metadata()?;
+            if !self.is_equal(&meta, &dest)? {
+                return Ok(());
+            }
+            std::fs::remove_file(&dest)?;
+        }
+        match symlink(&link_path, &dest) {
+            Err(e) => Err(anyhow::Error::msg(format!(
+                "Failed to create symlink {:?} -> {:?} Error {:?}",
+                src, dest, e
+            ))),
+            _ => Ok(()),
+        }?;
+        self.progress.add_copied(1);
         Ok(())
     }
 
@@ -200,25 +219,29 @@ impl Syncronize {
             _ => Ok(()),
         }
     }
-
-    fn symlink(&self, src: &Path, dest: &Path) -> anyhow::Result<()> {
-        match symlink(src, dest) {
-            Err(e) => Err(anyhow::Error::msg(format!(
-                "Failed to create symlink {:?} -> {:?} Error {:?}",
-                src, dest, e
-            ))),
-            _ => Ok(()),
-        }
-    }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Progress {
-    last_tick: Mutex<Option<std::time::Instant>>,
+    last_tick: Mutex<std::time::Instant>,
+    start: std::time::Instant,
     paths: AtomicUsize,
     paths_copied: AtomicUsize,
     paths_skipped: AtomicUsize,
     bytes_copied: AtomicUsize,
+}
+
+impl Default for Progress {
+    fn default() -> Self {
+        Self {
+            last_tick: Mutex::new(std::time::Instant::now()),
+            start: std::time::Instant::now(),
+            paths: AtomicUsize::default(),
+            paths_copied: AtomicUsize::default(),
+            paths_skipped: AtomicUsize::default(),
+            bytes_copied: AtomicUsize::default(),
+        }
+    }
 }
 
 impl Progress {
@@ -249,13 +272,9 @@ impl Progress {
 
     fn tick(&self) {
         let mut last_tick = self.last_tick.lock().unwrap();
-        if let Some(last) = *last_tick {
-            if last.elapsed() > Duration::from_millis(120) {
-                *last_tick = Some(std::time::Instant::now());
-                self.print();
-            }
-        } else {
-            *last_tick = Some(std::time::Instant::now());
+
+        if last_tick.elapsed() > Duration::from_millis(120) {
+            *last_tick = std::time::Instant::now();
             self.print();
         }
     }
@@ -265,13 +284,15 @@ impl Progress {
         let paths_copied = self.paths_copied.load(Ordering::Relaxed);
         let paths_skipped = self.paths_skipped.load(Ordering::Relaxed);
         let bytes_copied = self.bytes_copied.load(Ordering::Relaxed);
+        let elapsed = self.start.elapsed();
 
         eprint!(
-            "\rFiles: {}, Copied: {}, Skipped: {}, Transfered {}",
+            "\rFiles: {}, Copied: {}, Skipped: {}, Transfered {}, Elapsed: {:.2?}  ",
             paths,
             paths_copied,
             paths_skipped,
-            human_bytes::human_bytes(bytes_copied as f64)
+            human_bytes::human_bytes(bytes_copied as f64),
+            elapsed
         );
     }
 }
@@ -303,7 +324,8 @@ mod tests {
     fn test_example() {
         let temp = temp_fs!(
             input / bar: 0,
-            input / baz / foo / bar: 0
+            input / baz / foo / bar: 0,
+            input / baz / foo / bean: 0,
         );
         let sync = Syncronize::new(temp.path().join("input"), temp.path().join("output"));
         sync.sync().unwrap();
@@ -314,8 +336,9 @@ mod tests {
                 "output".to_string(),
                 "output/baz".to_string(),
                 "output/baz/foo".to_string(),
+                "output/baz/foo/bean.text".to_string(),
                 "output/baz/foo/bar.text".to_string(),
-                "output/bar.text".to_string()
+                "output/bar.text".to_string(),
             ]
         );
     }
