@@ -1,8 +1,11 @@
-use jwalk::DirEntry;
+use jwalk::{DirEntry, Parallelism};
 use rayon::ThreadPool;
 use std::{
     borrow::Borrow,
-    fs::Metadata,
+    collections::HashSet,
+    fs::{self, Metadata},
+    io,
+    ops::Sub,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -29,6 +32,14 @@ pub struct Syncronize {
     // Reporting
     progress: Progress,
 }
+
+#[derive(Debug, Default, Clone)]
+struct DirState {
+    is_error: bool,
+    error: Arc<Mutex<Option<io::Error>>>,
+}
+
+type ClientState = (DirState, ());
 
 impl Syncronize {
     pub fn new<A: Into<PathBuf>, B: Into<PathBuf>>(src: A, dest: B) -> Self {
@@ -68,20 +79,31 @@ impl Syncronize {
 
         // Threadpool used by jwalk
         let thread_pool = Arc::new(sync.get_thread_pool()?);
+        let parallelism = jwalk::Parallelism::RayonExistingPool {
+            pool: thread_pool.clone(),
+            busy_timeout: None,
+        };
 
         // Read all source files and create the destination folder structure
         let sync_clone = sync.clone();
-        let src_files = jwalk::WalkDirGeneric::<((), ())>::new(&sync_clone.src)
+        let src_files = jwalk::WalkDirGeneric::<ClientState>::new(&sync_clone.src)
             .skip_hidden(sync_clone.skip_hidden)
-            .parallelism(jwalk::Parallelism::RayonExistingPool {
-                pool: thread_pool.clone(),
-                busy_timeout: None,
-            })
+            .parallelism(parallelism.clone())
             .process_read_dir(move |depth, path, state, c| {
                 if depth.is_none() {
                     return;
                 }
-                sync_clone.sync_dir(&path, c);
+                if state.is_error {
+                    return;
+                }
+                let parallelism = parallelism.clone();
+                match sync_clone.sync_dir(&path, c, parallelism) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        state.is_error = true;
+                        state.error.lock().unwrap().replace(e);
+                    }
+                }
             });
 
         // Write symlinks
@@ -98,10 +120,17 @@ impl Syncronize {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
+        sync.progress.print();
+
         Ok(())
     }
 
-    fn sync_dir(&self, dir: &Path, children: &mut Vec<jwalk::Result<DirEntry<((), ())>>>) {
+    fn sync_dir(
+        &self,
+        dir: &Path,
+        children: &mut Vec<jwalk::Result<DirEntry<ClientState>>>,
+        parallelism: Parallelism,
+    ) -> io::Result<()> {
         // Update progress
         self.progress.add_source(children.len());
 
@@ -117,12 +146,22 @@ impl Syncronize {
             self.progress.add_skipped(1);
         }
 
+        let mut deletes = HashSet::new();
+        if self.delete {
+            deletes = fs::read_dir(dest)?
+                .into_iter()
+                .map(|x| x.map(|y| y.path()))
+                .collect::<io::Result<HashSet<_>>>()?;
+        }
+
         // Syncronize files
         for entry in children {
             if let Ok(entry) = entry {
                 let pth = entry.path();
+                let dest = self.get_destination_path(&pth);
+                deletes.remove(&dest);
                 if pth.is_file() && !pth.is_symlink() {
-                    match self.sync_file(&entry.path()) {
+                    match self.sync_file(&entry.path(), &dest) {
                         Ok(_) => {}
                         Err(e) => {
                             self.progress.println(format!(
@@ -136,11 +175,16 @@ impl Syncronize {
                 }
             }
         }
+
+        for delete in deletes.into_iter() {
+            self.remove_all(&delete)?;
+        }
+
+        Ok(())
     }
 
-    fn sync_file(&self, src: &Path) -> anyhow::Result<()> {
+    fn sync_file(&self, src: &Path, dest: &Path) -> anyhow::Result<()> {
         let meta = src.symlink_metadata()?;
-        let dest = self.get_destination_path(&src);
         let exists = dest.exists();
 
         if exists && self.is_equal(&meta, &dest)? {
@@ -187,6 +231,26 @@ impl Syncronize {
         Ok(())
     }
 
+    fn remove_all(&self, path: &Path) -> io::Result<()> {
+        let filetype = fs::symlink_metadata(path)?.file_type();
+        if filetype.is_symlink() || filetype.is_file() {
+            fs::remove_file(path)?;
+            self.progress.add_deleted(1);
+            Ok(())
+        } else {
+            for child in fs::read_dir(path)? {
+                let child = child?;
+                if child.file_type()?.is_dir() {
+                    self.remove_all(&child.path())?;
+                } else {
+                    fs::remove_file(&child.path())?;
+                    self.progress.add_deleted(1);
+                }
+            }
+            Ok(())
+        }
+    }
+
     fn get_thread_pool(&self) -> anyhow::Result<ThreadPool> {
         let mut pool = rayon::ThreadPoolBuilder::new();
         if let Some(threads) = self.num_threads {
@@ -226,6 +290,7 @@ struct Progress {
     last_tick: Mutex<std::time::Instant>,
     start: std::time::Instant,
     paths: AtomicUsize,
+    paths_deleted: AtomicUsize,
     paths_copied: AtomicUsize,
     paths_skipped: AtomicUsize,
     bytes_copied: AtomicUsize,
@@ -234,9 +299,10 @@ struct Progress {
 impl Default for Progress {
     fn default() -> Self {
         Self {
-            last_tick: Mutex::new(std::time::Instant::now()),
+            last_tick: Mutex::new(std::time::Instant::now().sub(Duration::from_millis(120))),
             start: std::time::Instant::now(),
             paths: AtomicUsize::default(),
+            paths_deleted: AtomicUsize::default(),
             paths_copied: AtomicUsize::default(),
             paths_skipped: AtomicUsize::default(),
             bytes_copied: AtomicUsize::default(),
@@ -257,6 +323,11 @@ impl Progress {
 
     fn add_skipped(&self, bytes: usize) {
         self.paths_skipped.fetch_add(bytes, Ordering::Relaxed);
+        self.tick();
+    }
+
+    fn add_deleted(&self, bytes: usize) {
+        self.paths_deleted.fetch_add(bytes, Ordering::Relaxed);
         self.tick();
     }
 
@@ -283,16 +354,23 @@ impl Progress {
         let paths = self.paths.load(Ordering::Relaxed);
         let paths_copied = self.paths_copied.load(Ordering::Relaxed);
         let paths_skipped = self.paths_skipped.load(Ordering::Relaxed);
+        let paths_deleted = self.paths_deleted.load(Ordering::Relaxed);
         let bytes_copied = self.bytes_copied.load(Ordering::Relaxed);
         let elapsed = self.start.elapsed();
 
+        let del = match paths_deleted > 0 {
+            true => format!("Deleted {:?} ", paths_deleted),
+            false => "".to_string(),
+        };
+
         eprint!(
-            "\rFiles: {}, Copied: {}, Skipped: {}, Transfered {}, Elapsed: {:.2?}  ",
+            "\rFiles: {}, Copied: {}, Skipped: {}, Transfered {}, {}Elapsed: {:.2?} ",
             paths,
             paths_copied,
             paths_skipped,
             human_bytes::human_bytes(bytes_copied as f64),
-            elapsed
+            del,
+            elapsed,
         );
     }
 }
