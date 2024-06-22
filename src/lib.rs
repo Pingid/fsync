@@ -1,4 +1,4 @@
-use jwalk::{DirEntry, Parallelism};
+use jwalk::DirEntry;
 use rayon::ThreadPool;
 use std::{
     borrow::Borrow,
@@ -88,7 +88,7 @@ impl Syncronize {
         let sync_clone = sync.clone();
         let src_files = jwalk::WalkDirGeneric::<ClientState>::new(&sync_clone.src)
             .skip_hidden(sync_clone.skip_hidden)
-            .parallelism(parallelism.clone())
+            .parallelism(parallelism)
             .process_read_dir(move |depth, path, state, c| {
                 if depth.is_none() {
                     return;
@@ -96,8 +96,7 @@ impl Syncronize {
                 if state.is_error {
                     return;
                 }
-                let parallelism = parallelism.clone();
-                match sync_clone.sync_dir(&path, c, parallelism) {
+                match sync_clone.sync_dir(&path, c) {
                     Ok(_) => {}
                     Err(e) => {
                         state.is_error = true;
@@ -129,7 +128,6 @@ impl Syncronize {
         &self,
         dir: &Path,
         children: &mut Vec<jwalk::Result<DirEntry<ClientState>>>,
-        parallelism: Parallelism,
     ) -> io::Result<()> {
         // Update progress
         self.progress.add_source(children.len());

@@ -3,7 +3,8 @@ use fsync::Syncronize;
 
 fn main() {
     let matches = Command::new("fsync")
-        .about("Synchronizes directories")
+        .arg_required_else_help(true)
+        .about("Synchronizes files between two directories")
         .arg(
             Arg::new("source")
                 .required(true)
