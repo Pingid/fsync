@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use fsync::{temp_fs, Syncronize};
+use fsync::{temp_fs, Synchronize};
 
 fn benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("syncing directory");
@@ -21,7 +21,7 @@ fn benchmark(c: &mut Criterion) {
                 );
                 (temp.path().join("input"), temp.path().join("output"))
             },
-            |(input, output)| Syncronize::new(input.clone(), output.clone()).sync(),
+            |(input, output)| Synchronize::new(input.clone(), output.clone()).sync(),
             BatchSize::SmallInput,
         )
     });

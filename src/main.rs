@@ -1,5 +1,5 @@
 use clap::{Arg, ArgAction, Command};
-use fsync::Syncronize;
+use fsync::Synchronize;
 
 fn main() {
     let matches = Command::new("fsync")
@@ -25,6 +25,13 @@ fn main() {
                 .help("Delete files in the destination that are not in the source"),
         )
         .arg(
+            Arg::new("check-content")
+                .long("checkout-content")
+                .short('c')
+                .action(ArgAction::SetTrue)
+                .help("Use checksums to compare files instead of modified time"),
+        )
+        .arg(
             Arg::new("threads")
                 .long("threads")
                 .help("Number of threads to use defaults to rayon default threadpool"),
@@ -34,13 +41,15 @@ fn main() {
     let source = matches.get_one::<String>("source").unwrap();
     let destination = matches.get_one::<String>("destination").unwrap();
     let delete = matches.get_flag("delete");
+    let check_content = matches.get_flag("check-content");
     let threads = matches
         .get_one::<String>("threads")
         .and_then(|x| x.parse::<u8>().ok());
 
-    let sync = Syncronize::new(source, destination)
+    let sync = Synchronize::new(source, destination)
         .delete(delete)
         .num_threads(threads)
+        .check_content(check_content)
         .display_progress(true);
 
     match sync.sync() {

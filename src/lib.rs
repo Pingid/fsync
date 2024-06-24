@@ -4,7 +4,7 @@ use std::{
     borrow::Borrow,
     collections::HashSet,
     fs::{self, Metadata},
-    io,
+    io::{self, Read},
     ops::Sub,
     path::{Path, PathBuf},
     sync::{
@@ -20,7 +20,7 @@ use std::os::unix::fs::symlink;
 #[cfg(windows)]
 use std::os::windows::fs::symlink_file as symlink;
 
-pub struct Syncronize {
+pub struct Synchronize {
     src: PathBuf,
     dest: PathBuf,
     // Configuration
@@ -28,6 +28,7 @@ pub struct Syncronize {
     num_threads: Option<u8>,
     skip_hidden: bool,
     display_progress: bool,
+    check_content: bool,
 
     // Reporting
     progress: Progress,
@@ -41,7 +42,7 @@ struct DirState {
 
 type ClientState = (DirState, ());
 
-impl Syncronize {
+impl Synchronize {
     pub fn new<A: Into<PathBuf>, B: Into<PathBuf>>(src: A, dest: B) -> Self {
         Self {
             src: src.into(),
@@ -49,6 +50,7 @@ impl Syncronize {
             delete: false,
             num_threads: None,
             skip_hidden: false,
+            check_content: false,
             display_progress: false,
             progress: Progress::default(),
         }
@@ -74,6 +76,11 @@ impl Syncronize {
         self
     }
 
+    pub fn check_content(mut self, value: bool) -> Self {
+        self.check_content = value;
+        self
+    }
+
     pub fn sync(self) -> anyhow::Result<()> {
         let sync = Arc::new(self);
 
@@ -96,7 +103,7 @@ impl Syncronize {
                 if state.is_error {
                     return;
                 }
-                match sync_clone.sync_dir(&path, c) {
+                match sync_clone.sync_dir(path, c) {
                     Ok(_) => {}
                     Err(e) => {
                         state.is_error = true;
@@ -127,13 +134,13 @@ impl Syncronize {
     fn sync_dir(
         &self,
         dir: &Path,
-        children: &mut Vec<jwalk::Result<DirEntry<ClientState>>>,
+        children: &mut [jwalk::Result<DirEntry<ClientState>>],
     ) -> io::Result<()> {
         // Update progress
         self.progress.add_source(children.len());
 
         // Create destination directory if it doesn't already exist
-        let dest = self.get_destination_path(&dir);
+        let dest = self.get_destination_path(dir);
         if !dest.exists() {
             match std::fs::create_dir(&dest) {
                 Ok(_) => {}
@@ -147,28 +154,25 @@ impl Syncronize {
         let mut deletes = HashSet::new();
         if self.delete {
             deletes = fs::read_dir(dest)?
-                .into_iter()
                 .map(|x| x.map(|y| y.path()))
                 .collect::<io::Result<HashSet<_>>>()?;
         }
 
         // Syncronize files
-        for entry in children {
-            if let Ok(entry) = entry {
-                let pth = entry.path();
-                let dest = self.get_destination_path(&pth);
-                deletes.remove(&dest);
-                if pth.is_file() && !pth.is_symlink() {
-                    match self.sync_file(&entry.path(), &dest) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            self.progress.println(format!(
-                                "Error syncing {:?}: {:?}",
-                                &entry.path(),
-                                e
-                            ));
-                            entry.read_children_path = None;
-                        }
+        for entry in children.iter_mut().flatten() {
+            let pth = entry.path();
+            let dest = self.get_destination_path(&pth);
+            deletes.remove(&dest);
+            if pth.is_file() && !pth.is_symlink() {
+                match self.sync_file(&entry.path(), &dest) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.progress.println(format!(
+                            "Error syncing {:?}: {:?}",
+                            &entry.path(),
+                            e
+                        ));
+                        entry.read_children_path = None;
                     }
                 }
             }
@@ -185,32 +189,35 @@ impl Syncronize {
         let meta = src.symlink_metadata()?;
         let exists = dest.exists();
 
-        if exists && self.is_equal(&meta, &dest)? {
+        if exists
+            && (self.check_content && self.check_content_equal(src, dest).unwrap_or(false)
+                || self.is_equal(&meta, dest).unwrap_or(false))
+        {
             self.progress.add_skipped(1);
             return Ok(());
         }
 
         // Copy file data
-        self.copy_file(&meta, &src, &dest)?;
+        self.copy_file(&meta, src, dest)?;
 
         self.progress.add_copied(1);
         self.progress.add_bytes_copied(meta.len() as usize);
 
         // Preserve permissions
         let perm = meta.permissions();
-        std::fs::set_permissions(&dest, perm)?;
+        std::fs::set_permissions(dest, perm)?;
 
         // Preserve modified time
         let mtime = meta.modified()?;
         let atime = meta.accessed()?;
-        filetime::set_file_times(&dest, atime.into(), mtime.into())?;
+        filetime::set_file_times(dest, atime.into(), mtime.into())?;
 
         Ok(())
     }
 
     fn sync_symlink(&self, src: &Path) -> anyhow::Result<()> {
-        let dest: PathBuf = self.get_destination_path(&src);
-        let link_path = std::fs::read_link(&src)?;
+        let dest: PathBuf = self.get_destination_path(src);
+        let link_path = std::fs::read_link(src)?;
         if dest.exists() {
             let meta = src.symlink_metadata()?;
             if !self.is_equal(&meta, &dest)? {
@@ -241,7 +248,7 @@ impl Syncronize {
                 if child.file_type()?.is_dir() {
                     self.remove_all(&child.path())?;
                 } else {
-                    fs::remove_file(&child.path())?;
+                    fs::remove_file(child.path())?;
                     self.progress.add_deleted(1);
                 }
             }
@@ -258,13 +265,40 @@ impl Syncronize {
         Ok(pool)
     }
 
-    fn is_equal(&self, src_meta: &Metadata, dest_path: &Path) -> anyhow::Result<bool> {
-        let dest_meta = dest_path.metadata()?;
+    fn is_equal(&self, src_meta: &Metadata, dest_path: impl AsRef<Path>) -> anyhow::Result<bool> {
+        let dest_meta = dest_path.as_ref().metadata()?;
         let same_l = dest_meta.len() == src_meta.len();
         let same_m = dest_meta.modified()? == src_meta.modified()?;
         Ok(same_l && same_m)
     }
 
+    fn check_content_equal(
+        &self,
+        src: impl AsRef<Path>,
+        dest: impl AsRef<Path>,
+    ) -> anyhow::Result<bool> {
+        let mut file1 = fs::File::open(src.as_ref())?;
+        let mut file2 = fs::File::open(dest.as_ref())?;
+
+        let mut buffer1 = [0; 1024]; // Using a buffer of 1024 bytes
+        let mut buffer2 = [0; 1024];
+
+        loop {
+            let count1 = file1.read(&mut buffer1)?;
+            let count2 = file2.read(&mut buffer2)?;
+
+            if count1 != count2 || buffer1[..count1] != buffer2[..count2] {
+                return Ok(false);
+            }
+
+            if count1 == 0 || count2 == 0 {
+                break;
+            }
+        }
+
+        Ok(true)
+        //sz
+    }
     fn get_destination_path(&self, src_path: &Path) -> PathBuf {
         let mut dest = self.dest.clone();
         dest.push(src_path.strip_prefix(&self.src).unwrap());
@@ -273,7 +307,7 @@ impl Syncronize {
 
     // File system utilities
     fn copy_file(&self, _meta: &Metadata, original: &Path, link: &Path) -> anyhow::Result<()> {
-        match std::fs::copy(&original, &link) {
+        match std::fs::copy(original, link) {
             Err(e) => Err(anyhow::Error::msg(format!(
                 "Failed to copy file {:?} -> {:?} Error {:?}",
                 link, original, e
@@ -373,13 +407,31 @@ impl Progress {
     }
 }
 
+#[macro_export]
+macro_rules! temp_fs {
+    ($($($dir:ident)/+: $file:expr),+ $(,)?) => {{
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        $(
+            {
+                let path = concat!($(stringify!($dir), "/",)+);
+                let path = temp.path().join(format!("{}.text", &path[0..path.len() - 1]));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let mut file = std::fs::File::create(&path).unwrap();
+                file.write_all(&[b'a'; $file]).unwrap();
+            }
+        )+
+        temp
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use crate::temp_fs;
 
-    use super::Syncronize;
+    use super::Synchronize;
     use jwalk::WalkDir;
 
     pub fn paths<P: AsRef<Path>>(walk: WalkDir, rel: P) -> Vec<String> {
@@ -403,7 +455,7 @@ mod tests {
             input / baz / foo / bar: 0,
             input / baz / foo / bean: 0,
         );
-        let sync = Syncronize::new(temp.path().join("input"), temp.path().join("output"));
+        let sync = Synchronize::new(temp.path().join("input"), temp.path().join("output"));
         sync.sync().unwrap();
         let paths = paths(jwalk::WalkDir::new(temp.path().join("output")), temp.path());
         assert_eq!(
@@ -418,22 +470,4 @@ mod tests {
             ]
         );
     }
-}
-
-#[macro_export]
-macro_rules! temp_fs {
-    ($($($dir:ident)/+: $file:expr),+ $(,)?) => {{
-        use std::io::Write;
-        let temp = tempfile::tempdir().unwrap();
-        $(
-            {
-            let path = concat!($(stringify!($dir), "/",)+);
-            let path = temp.path().join(format!("{}.text", &path[0..path.len() - 1]));
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let mut file = std::fs::File::create(&path).unwrap();
-            file.write(&vec!['a' as u8; $file]).unwrap();
-            }
-        )+
-        temp
-    }};
 }
