@@ -29,6 +29,7 @@ pub struct Synchronize {
     skip_hidden: bool,
     display_progress: bool,
     check_content: bool,
+    skip_permissions: bool,
 
     // Reporting
     progress: Progress,
@@ -52,6 +53,7 @@ impl Synchronize {
             skip_hidden: false,
             check_content: false,
             display_progress: false,
+            skip_permissions: false,
             progress: Progress::default(),
         }
     }
@@ -78,6 +80,11 @@ impl Synchronize {
 
     pub fn check_content(mut self, value: bool) -> Self {
         self.check_content = value;
+        self
+    }
+
+    pub fn skip_permissions(mut self, value: bool) -> Self {
+        self.skip_permissions = value;
         self
     }
 
@@ -204,8 +211,10 @@ impl Synchronize {
         self.progress.add_bytes_copied(meta.len() as usize);
 
         // Preserve permissions
-        let perm = meta.permissions();
-        std::fs::set_permissions(dest, perm)?;
+        if !self.skip_permissions {
+            let perm = meta.permissions();
+            std::fs::set_permissions(dest, perm)?;
+        }
 
         // Preserve modified time
         let mtime = meta.modified()?;

@@ -32,6 +32,12 @@ fn main() {
                 .help("Use checksums to compare files instead of modified time"),
         )
         .arg(
+            Arg::new("skip-permissions")
+                .long("skip-permissions")
+                .action(ArgAction::SetTrue)
+                .help("Skip copying file permissions"),
+        )
+        .arg(
             Arg::new("threads")
                 .long("threads")
                 .help("Number of threads to use defaults to rayon default threadpool"),
@@ -42,6 +48,7 @@ fn main() {
     let destination = matches.get_one::<String>("destination").unwrap();
     let delete = matches.get_flag("delete");
     let check_content = matches.get_flag("check-content");
+    let skip_permissions = matches.get_flag("skip-permissions");
     let threads = matches
         .get_one::<String>("threads")
         .and_then(|x| x.parse::<u8>().ok());
@@ -50,7 +57,8 @@ fn main() {
         .delete(delete)
         .num_threads(threads)
         .check_content(check_content)
-        .display_progress(true);
+        .display_progress(true)
+        .skip_permissions(skip_permissions);
 
     match sync.sync() {
         Ok(_) => {}
